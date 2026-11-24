@@ -12,7 +12,7 @@ import 'dotenv/config';
 import fse from 'fs-extra';
 import config from './config.js';
 import logger from './logger.js';
-import { loadExistingSessions } from './baileys.js';
+import { listSessions, loadExistingSessions } from './baileys.js';
 import { startServer } from './server.js';
 
 async function main() {
@@ -31,8 +31,18 @@ async function main() {
   });
 }
 
-process.on('SIGTERM', () => { logger.info('SIGTERM'); process.exit(0); });
-process.on('SIGINT',  () => { logger.info('SIGINT');  process.exit(0); });
+const processStart = Date.now();
+const onSignal = (signal) => {
+  logger.warn({
+    event: 'process_signal',
+    signal,
+    uptimeMs: Date.now() - processStart,
+    sessions: listSessions(),
+  }, `Señal ${signal} recibida — el orquestador está deteniendo el task`);
+  process.exit(0);
+};
+process.on('SIGTERM', () => onSignal('SIGTERM'));
+process.on('SIGINT',  () => onSignal('SIGINT'));
 
 process.on('uncaughtException', (err) => {
   logger.error({ err: err.message, stack: err.stack }, 'Error no capturado');

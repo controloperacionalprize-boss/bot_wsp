@@ -20,11 +20,25 @@ import config from './config.js';
 import logger from './logger.js';
 import { sleep } from './utils.js';
 
-const baileysLogger = pino({ level: 'silent' });
+const baileysLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'silent' });
+const processStart = Date.now();
+
+function disconnectInfo(lastDisconnect) {
+  const err = lastDisconnect?.error;
+  const boom = err instanceof Boom ? err : null;
+  const payload = boom?.output?.payload || {};
+  return {
+    err: err?.message || null,
+    statusCode: boom?.output?.statusCode ?? null,
+    reason: payload.reason || payload.message || null,
+    payloadCode: payload.code ?? null,
+    when: lastDisconnect?.when ? new Date(lastDisconnect.when).toISOString() : null,
+  };
+}
 
 /**
  * sessions: Map<sessionId, SessionState>
- * SessionState: { sock, isConnected, qrDataUrl, reconnectAttempts, readyResolve }
+ * SessionState: { sock, isConnected, qrDataUrl, reconnectAttempts, waiters }
  */
 const sessions = new Map();
 
@@ -64,7 +78,7 @@ export async function createSession(sessionId) {
     isConnected: false,
     qrDataUrl: null,
     reconnectAttempts: 0,
-    readyResolve: null,
+    waiters: new Set(),
   };
   sessions.set(sessionId, s);
   await connect(sessionId);
@@ -94,7 +108,12 @@ export async function loadExistingSessions() {
   const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
 
   if (dirs.length === 0) {
-    logger.info('No hay sesiones previas. Creá una en GET /sessions/:id/qr');
+    logger.error({
+      event: 'auth_dir_empty',
+      authDir: config.paths.auth,
+      entries: entries.map((e) => e.name),
+      uptimeMs: Date.now() - processStart,
+    }, 'No hay sesiones previas. Revisá el montaje EFS: Creá una en GET /sessions/:id/qr');
     return;
   }
 
@@ -120,7 +139,14 @@ async function connect(sessionId) {
   const { state, saveCreds } = await useMultiFileAuthState(ap);
   const { version } = await fetchLatestBaileysVersion();
 
-  logger.info({ sessionId, version }, 'Iniciando Baileys');
+  logger.info({
+    event: 'baileys_start',
+    sessionId,
+    version,
+    authDir: ap,
+    authenticated: !!state.creds?.me,
+    uptimeMs: Date.now() - processStart,
+  }, 'Iniciando Baileys');
 
   const sock = makeWASocket({
     version,
@@ -140,6 +166,16 @@ async function connect(sessionId) {
   s.sock = sock;
   sock.ev.on('creds.update', saveCreds);
 
+  sock.ws?.on?.('close', (code, reason) => {
+    logger.warn({
+      event: 'ws_close_frame',
+      sessionId,
+      code,
+      reason: reason?.toString?.() || null,
+      uptimeMs: Date.now() - processStart,
+    }, 'WebSocket cerrado por el par');
+  });
+
   sock.ev.on('messages.update', (updates) => {
     for (const u of updates) {
       if (!u.update?.status) continue;
@@ -156,15 +192,27 @@ async function connect(sessionId) {
       logger.info({ sessionId }, `⚡ QR listo — abrí /sessions/${sessionId}/qr en el navegador`);
     }
 
+    if (connection === 'connecting') {
+      logger.info({
+        event: 'whatsapp_connecting',
+        sessionId,
+        reconnectAttempts: s.reconnectAttempts,
+        uptimeMs: Date.now() - processStart,
+      }, 'Conectando a WhatsApp...');
+    }
+
     if (connection === 'open') {
       s.isConnected = true;
       s.qrDataUrl = null;
       s.reconnectAttempts = 0;
-      logger.info({ sessionId }, '✅ WhatsApp conectado');
-      if (s.readyResolve) {
-        s.readyResolve();
-        s.readyResolve = null;
-      }
+      logger.info({
+        event: 'whatsapp_connected',
+        sessionId,
+        phone: s.sock?.user?.id?.split(':')[0].split('@')[0] || null,
+        uptimeMs: Date.now() - processStart,
+      }, '✅ WhatsApp conectado');
+      for (const resolve of s.waiters) resolve();
+      s.waiters.clear();
     }
 
     if (connection === 'close') {
@@ -173,7 +221,15 @@ async function connect(sessionId) {
       const statusCode = boom?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-      logger.warn({ sessionId, statusCode, shouldReconnect }, 'Conexión cerrada');
+      logger.warn({
+        event: 'whatsapp_disconnected',
+        sessionId,
+        connection,
+        shouldReconnect,
+        reconnectAttempts: s.reconnectAttempts,
+        uptimeMs: Date.now() - processStart,
+        ...disconnectInfo(lastDisconnect),
+      }, 'Conexión cerrada');
 
       if (shouldReconnect) {
         await handleReconnect(sessionId);
@@ -213,9 +269,43 @@ async function handleReconnect(sessionId) {
 
 // ─── Envío ───────────────────────────────────────────────────────────────────
 
-export async function sendDocumentVia(sessionId, jid, fileBuffer, filename, caption) {
+const WAIT_CONNECT_MS = parseInt(process.env.WAIT_CONNECT_MS || '90000', 10);
+
+/**
+ * Espera a que la sesión termine de reconectarse antes de enviar.
+ * Si la sesión no existe en este proceso (auth vacío), falla de inmediato.
+ */
+function waitForConnection(sessionId) {
   const s = sessions.get(sessionId);
-  if (!s?.isConnected) throw new Error(`Sesión "${sessionId}" no está conectada`);
+  if (!s) {
+    throw new Error(`Sesión "${sessionId}" no cargada en este proceso — generá el QR con GET /sessions/${sessionId}/qr`);
+  }
+  if (s.isConnected) return Promise.resolve();
+
+  logger.warn({
+    event: 'send_waiting_connection',
+    sessionId,
+    reconnectAttempts: s.reconnectAttempts,
+    timeoutMs: WAIT_CONNECT_MS,
+  }, 'Sesión desconectada — esperando reconexión antes de enviar');
+
+  return new Promise((resolve, reject) => {
+    const waiter = () => {
+      clearTimeout(timer);
+      s.waiters.delete(waiter);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      s.waiters.delete(waiter);
+      reject(new Error(`Sesión "${sessionId}" sigue desconectada tras ${WAIT_CONNECT_MS / 1000}s (intentos: ${s.reconnectAttempts})`));
+    }, WAIT_CONNECT_MS);
+    s.waiters.add(waiter);
+  });
+}
+
+export async function sendDocumentVia(sessionId, jid, fileBuffer, filename, caption) {
+  await waitForConnection(sessionId);
+  const s = sessions.get(sessionId);
   logger.info({ sessionId, jid, filename }, 'Enviando documento');
   const result = await s.sock.sendMessage(jid, {
     document: fileBuffer,
@@ -227,16 +317,16 @@ export async function sendDocumentVia(sessionId, jid, fileBuffer, filename, capt
 }
 
 export async function sendImageVia(sessionId, jid, imageBuffer, mimetype, caption) {
+  await waitForConnection(sessionId);
   const s = sessions.get(sessionId);
-  if (!s?.isConnected) throw new Error(`Sesión "${sessionId}" no está conectada`);
   logger.info({ sessionId, jid, mimetype }, 'Enviando imagen');
   const result = await s.sock.sendMessage(jid, { image: imageBuffer, mimetype, caption });
   logger.info({ sessionId, jid, msgId: result?.key?.id, status: result?.status }, '✅ Imagen enviada');
 }
 
 export async function sendTextVia(sessionId, jid, text) {
+  await waitForConnection(sessionId);
   const s = sessions.get(sessionId);
-  if (!s?.isConnected) throw new Error(`Sesión "${sessionId}" no está conectada`);
   logger.info({ sessionId, jid }, 'Enviando texto');
   const result = await s.sock.sendMessage(jid, { text });
   logger.info({ sessionId, jid, msgId: result?.key?.id, status: result?.status }, '✅ Texto enviado');
